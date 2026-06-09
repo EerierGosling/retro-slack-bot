@@ -1,3 +1,5 @@
 /__pycache__
 retro_users.db
 .env
+.DS_Store
+.vscode

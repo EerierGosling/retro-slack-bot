@@ -1,218 +1,299 @@
-
-
 import os
 import time
-import sqlite3
 import pickle
+import psycopg2
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
-from RetroSDK import Retro
-
+from retro_sdk import Retro, FieldFilter
+from datetime import datetime, timedelta, timezone
 
 load_dotenv()
 
-DB_PATH = "retro_users.db"
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+from urllib.parse import quote
+
+def card_image_url(url):
+    return f"https://wsrv.nl/?url={quote(url, safe='')}&w=1572&h=884&fit=contain&bg=transparent"
+
+def avatar_image_url(url):
+    return f"https://wsrv.nl/?url={quote(url, safe='')}&w=36&h=36&fit=cover"
+
+def get_cursor():
+    global conn
+    try:
+        conn.isolation_level
+    except Exception:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        conn.autocommit = True
+    return conn.cursor()
+
+conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+conn.autocommit = True
 cur = conn.cursor()
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     slack_id TEXT PRIMARY KEY,
-    retro_blob BLOB
+    retro_username TEXT,
+    retro_blob BYTEA
 )
 """)
-conn.commit()
+cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS retro_username TEXT")
+cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS show_location BOOLEAN DEFAULT TRUE")
 
-def save_user(slack_id, retro_obj):
-    blob = pickle.dumps(retro_obj)
-    cur.execute("REPLACE INTO users (slack_id, retro_blob) VALUES (?, ?)", (slack_id, blob))
-    conn.commit()
+def save_retro_id(slack_id, user_id):
+    c = get_cursor()
+    c.execute(
+        """
+        INSERT INTO users (slack_id, retro_username) VALUES (%s, %s)
+        ON CONFLICT (slack_id) DO UPDATE SET retro_username = EXCLUDED.retro_username
+        """,
+        (slack_id, user_id)
+    )
 
-def load_user(slack_id):
-    cur.execute("SELECT retro_blob FROM users WHERE slack_id = ?", (slack_id,))
-    row = cur.fetchone()
-    if row:
-        return pickle.loads(row[0])
-    return None
+def get_user_id(slack_id):
+    c = get_cursor()
+    c.execute("SELECT retro_username FROM users WHERE slack_id = %s", (slack_id,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+def get_show_location(slack_id):
+    c = get_cursor()
+    c.execute("SELECT show_location FROM users WHERE slack_id = %s", (slack_id,))
+    row = c.fetchone()
+    return row[0] if row is not None else True
+
+def save_show_location(slack_id, value):
+    c = get_cursor()
+    c.execute(
+        """
+        INSERT INTO users (slack_id, show_location) VALUES (%s, %s)
+        ON CONFLICT (slack_id) DO UPDATE SET show_location = EXCLUDED.show_location
+        """,
+        (slack_id, value)
+    )
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
+retro = Retro(refresh_token=os.getenv("RETRO_REFRESH_TOKEN"))
 
-# Global rate limit: timestamp of last code request
-last_code_request_time = 0
+selected_posts = {}  # slack_id -> set of post ids
+home_cache = {}  # slack_id -> {week: [post, ...]}
 
-
-# In-memory cache for active users (optional, for performance)
-users = {}
-
-# Catch-all action handler for debugging
-@app.action({"type": "block_actions"})
-def catch_all_actions(ack, body, logger):
+@app.command("/link-retro-account")
+def link_retro_account(ack, body, respond):
     ack()
-    print("[DEBUG] Received action:")
-    print(body)
+    username = body.get("text", "").strip()
+    if not username:
+        respond("please provide your retro username: `/link-retro-account [your-username]`")
+        return
+    slack_id = body["user_id"]
+    user_id = retro.get_user_id(username)
+    if not user_id:
+        respond(f"couldn't find a retro account with username *@{username}*. please check the spelling and try again.")
+        return
+    sent_request = retro.send_friend_request(user_id)
+    if not sent_request:
+        respond("failed to send friend request.")
+        return
+    save_retro_id(slack_id, user_id)
+    respond(f"linked your slack account to retro user *@{username}*. make sure to accept the friend request from @hcslackforwarder!")
+
+@app.command("/check-retro-link")
+def check_retro_link(ack, body, respond):
+    ack()
+    slack_id = body["user_id"]
+    user_id = get_user_id(slack_id)
+    if not user_id:
+        respond("you haven't linked your retro account yet!")
+        return
+    username = retro.get_user(user_id).get("username")
+    if not username:
+        respond("failed to retrieve your retro username.")
+        return
+    if not retro.get_friend_statuses(filter=FieldFilter("status", "==", "accepted")):
+        respond(f"you haven't accepted the friend request from @hcslackforwarder yet! please accept it to complete the linking process.")
+        return
+    save_retro_id(slack_id, user_id)
+    respond(f"your slack account is linked to retro user *@{username}*!")
 
 
-# App Home opened event: show Home tab with login button
-@app.event("app_home_opened")
-def update_home_tab(event, client, logger):
+def update_home_tab(event, client):
+    print("loading...")
     user_id = event["user"]
-    client.views_publish(
-        user_id=user_id,
-        view={
-            "type": "home",
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": "welcome!"}
-                },
-                {
-                    "type": "actions",
-                    "elements": [
+    retro_user_id = get_user_id(user_id)
+
+    if not retro.get_friend_statuses(filter=FieldFilter("status", "==", "accepted")):
+        blocks = [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "you haven't accepted the friend request from @hcslackforwarder yet! please accept it to complete the linking process."}
+            }
+        ]
+
+    elif not retro_user_id:
+        blocks = [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "link your retro account to get started!"}
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "use `/link-retro-account [your-username]` in any channel to link your account."}
+            }
+        ]
+
+    else:
+        show_location = get_show_location(user_id)
+
+        now = datetime.now()
+        weeks = []
+        for i in range(4):
+            iso = (now - timedelta(weeks=i)).isocalendar()
+            weeks.append(f"{iso[0]}_{iso[1]:02d}")
+
+        if user_id not in home_cache:
+            print("fetching from API...")
+            fetched = {}
+            for week in weeks:
+                print(f"  fetching week {week}")
+                posts = retro.get_week_media(retro_user_id, week)
+                fetched[week] = sorted(posts, key=lambda p: p.get("createdAt") or 0)
+            home_cache[user_id] = fetched
+        else:
+            print("using cache")
+
+        retro_user = retro.get_user(retro_user_id) or {}
+
+        toggle_option = {"text": {"type": "plain_text", "text": "Show locations"}, "value": "show_location"}
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f"welcome, @{retro_user.get('username')}!"}
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "checkboxes",
+                        "action_id": "toggle_show_location",
+                        "options": [toggle_option],
+                        "initial_options": [toggle_option] if show_location else []
+                    },
+                    {
+                        "type": "button",
+                        "action_id": "refresh_home",
+                        "text": {"type": "plain_text", "text": "↻ refresh"}
+                    }
+                ]
+            }
+        ]
+
+        for week in weeks:
+            posts = home_cache[user_id].get(week, [])
+
+            week_posts = []
+
+            for i, post in enumerate(posts):
+                comments = ""
+
+                dt = datetime.fromtimestamp(post.get("createdAt"), tz=timezone(timedelta(seconds=post.get("timeZoneOffset") or 0)))
+
+                if show_location and post.get("locationName"):
+                    title = {
+                        "title": {"type": "mrkdwn", "text": post.get("locationName"), "verbatim": False},
+                        "subtitle": {"type": "mrkdwn", "text": dt.strftime("%a, %b %-d"), "verbatim": False},
+                    }
+                else:
+                    title = {
+                        "title": {"type": "mrkdwn", "text": dt.strftime("%A"), "verbatim": False},
+                        "subtitle": {"type": "mrkdwn", "text": dt.strftime("%b %-d"), "verbatim": False},
+                    }
+
+                post_id = post.get("id")
+                is_selected = post_id in selected_posts.get(user_id, set())
+                card = {
+                    "type": "card",
+                    "block_id": f"carousel-card-{week}-{i}",
+                    **title,
+                    "hero_image": {
+                        "type": "image",
+                        "image_url": card_image_url(post.get("fullSizeURL")),
+                        "alt_text": "photo"
+                    },
+                    "actions": [
                         {
                             "type": "button",
-                            "action_id": "open_login_modal",
-                            "text": {"type": "plain_text", "text": "log in to retro"}
+                            "action_id": "select_post",
+                            "value": post_id,
+                            "text": {"type": "plain_text", "text": "✓ selected" if is_selected else "select"},
+                            **( {"style": "primary"} if is_selected else {} )
                         }
                     ]
                 }
-            ]
-        }
-    )
+                if comments:
+                    card["body"] = {"type": "mrkdwn", "text": comments, "verbatim": False}
+                week_posts.append(card)
 
-@app.action("open_login_modal")
-def handle_open_login_modal(ack, body, client):
+            if week_posts:
+                blocks.append({"type": "header", "text": {"type": "plain_text", "text": f"Week {week.split('_')[1]}"}})
+                blocks.append({"type": "carousel", "elements": week_posts[:10]})
+                blocks.append({
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "conversations_select",
+                            "action_id": f"pick_channel_{week}",
+                            "placeholder": {"type": "plain_text", "text": "pick a channel"}
+                        },
+                        {
+                            "type": "button",
+                            "action_id": f"post_week_{week}",
+                            "value": week,
+                            "text": {"type": "plain_text", "text": "post selected"}
+                        }
+                    ]
+                })
+
+    client.views_publish(user_id=user_id, view={"type": "home", "blocks": blocks})
+    print("loaded")
+
+@app.event("app_home_opened")
+def on_home_opened(event, client):
+    update_home_tab(event, client)
+
+@app.action("toggle_show_location")
+def handle_toggle_show_location(ack, body, client):
     ack()
-    print("pressed")
-    user_id = body["user"]["id"]
-    if user_id not in users:
-        retro = load_user(user_id)
-        if retro is None:
-            retro = Retro()
-        users[user_id] = retro
-        save_user(user_id, retro)
-    client.views_open(
-        trigger_id=body["trigger_id"],
-        view={
-            "type": "modal",
-            "callback_id": "phone_modal",
-            "title": {"type": "plain_text", "text": "log in to retro!"},
-            "submit": {"type": "plain_text", "text": "send code"},
-            "blocks": [
-                {
-                    "type": "input",
-                    "block_id": "phone_block",
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "phone_input",
-                        "placeholder": {"type": "plain_text", "text": "+1234567890"}
-                    },
-                    "label": {"type": "plain_text", "text": "please enter your phone number. it must be in international format (for example, if you have an american number, begin it with +1)."}
-                }
-            ]
-        }
-    )
+    slack_id = body["user"]["id"]
+    selected = body["actions"][0]["selected_options"]
+    save_show_location(slack_id, len(selected) > 0)
+    update_home_tab({"user": slack_id}, client)
 
-@app.view("phone_modal")
-def handle_phone_submission(ack, body, client, view):
+@app.action("refresh_home")
+def handle_refresh_home(ack, body, client):
     ack()
+    slack_id = body["user"]["id"]
+    home_cache.pop(slack_id, None)
+    update_home_tab({"user": slack_id}, client)
 
-    global last_code_request_time
-    user_id = body["user"]["id"]
+@app.action("select_post")
+def handle_select_post(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    post_id = body["actions"][0]["value"]
+    if slack_id not in selected_posts:
+        selected_posts[slack_id] = set()
+    if post_id in selected_posts[slack_id]:
+        selected_posts[slack_id].discard(post_id)
+    else:
+        selected_posts[slack_id].add(post_id)
+    update_home_tab({"user": slack_id}, client)
 
-    if user_id not in users:
-        retro = load_user(user_id)
-        if retro is not None:
-            users[user_id] = retro
-        else:
-            ack()
-            client.chat_postMessage(
-                channel=user_id,
-                text="please start over! there's no login in progress"
-            )
-            return
-
-    phone = view["state"]["values"]["phone_block"]["phone_input"]["value"].replace(" ", "").replace("-", "")
-    now = time.time()
-    if now - last_code_request_time < 60:
-        ack()
-        client.chat_postMessage(
-            channel=user_id,
-            text="please wait - you can only request one code per minute. (this limit is across all users)"
-        )
-        return
-    try:
-        users[user_id].send_code(phone)
-        print("sent code!")
-        last_code_request_time = now
-        save_user(user_id, users[user_id])
-    except Exception as e:
-        ack()
-        client.chat_postMessage(
-            channel=user_id,
-            text=f"Failed to send code: {e}"
-        )
-        print("failed to send (?):", e)
-        return
-    # Update the modal in-place to prompt for code
-    print("updating modal")
-    ack(
-        response_action="update",
-        view={
-            "type": "modal",
-            "callback_id": "code_modal",
-            "title": {"type": "plain_text", "text": "enter verification code"},
-            "submit": {"type": "plain_text", "text": "verify"},
-            "blocks": [
-                {
-                    "type": "input",
-                    "block_id": "code_block",
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "code_input",
-                        "placeholder": {"type": "plain_text", "text": "123456"}
-                    },
-                    "label": {"type": "plain_text", "text": "please enter the code you received"}
-                }
-            ]
-        }
-    )
-
-@app.view("code_modal")
-def handle_code_submission(ack, body, client, view):
-    print("entered code!")
-    try:
-        user_id = body["user"]["id"]
-        code = view["state"]["values"]["code_block"]["code_input"]["value"]
-        ack()  # Always ack first
-        if user_id not in users:
-            retro = load_user(user_id)
-            if retro is not None:
-                users[user_id] = retro
-            else:
-                client.chat_postMessage(
-                    channel=user_id,
-                    text="please start over! there's no login in progress"
-                )
-                return
-        try:
-            users[user_id].verify_code(code)
-            save_user(user_id, users[user_id])
-            client.chat_postMessage(
-                channel=user_id,
-                text="you're logged in!"
-            )
-        except Exception as e:
-            client.chat_postMessage(
-                channel=user_id,
-                text=f"verification failed: {e}"
-            )
-    except Exception as e:
-        # Failsafe: always ack to avoid Slack modal error
-        try:
-            ack()
-        except Exception:
-            pass
-        print(f"[ERROR] Exception in code_modal handler: {e}")
+@app.action("unlink_retro_account")
+def unlink_retro_account(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    get_cursor().execute("UPDATE users SET retro_username = NULL WHERE slack_id = %s", (slack_id,))
+    update_home_tab({"user": slack_id}, client)
 
 if __name__ == "__main__":
     SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN")).start()
