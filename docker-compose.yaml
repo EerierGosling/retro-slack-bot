@@ -1,0 +1,31 @@
+version: '3.8'
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: retro-db
+    restart: always
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  retro-forwarder:
+    build: .
+    container_name: retro-forwarder
+    restart: always
+    depends_on:
+      - db
+    environment:
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      - RETRO_REFRESH_TOKEN=${RETRO_REFRESH_TOKEN}
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: python app.py
+
+volumes:
+  postgres_data:
