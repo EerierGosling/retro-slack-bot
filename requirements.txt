@@ -4,3 +4,13 @@ psycopg2-binary==2.9.12
 python-dotenv==0.21.0
 retro-sdk==0.4.5
 requests==2.34.2
+pillow==10.4.0
+google-api-core==2.31.0
+google-auth==2.40.3
+google-cloud-core==2.6.0
+google-cloud-firestore==2.27.0
+googleapis-common-protos==1.75.0
+grpcio==1.81.0
+grpcio-status==1.81.0
+proto-plus==1.28.0
+protobuf==7.35.0
