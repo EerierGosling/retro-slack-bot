@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 
 load_dotenv()
 
+CMD = "/dev-" if os.getenv("DEVELOPMENT", "").lower() == "true" else "/"
+
 from urllib.parse import quote
 
 def card_image_url(url):
@@ -262,7 +264,7 @@ def build_dm_blocks(slack_id, week):
             {
                 "type": "conversations_select",
                 "action_id": "dm_pick_channel",
-                "placeholder": {"type": "context", "text": "Pick a channel"},
+                "placeholder": {"type": "plain_text", "text": "Pick a channel"},
                 **({"initial_conversation": selected_ch} if selected_ch else {})
             },
             {
@@ -281,13 +283,16 @@ def send_or_update_dm(slack_id, week, new_posts, client):
         return
     week_pending = dm_pending.setdefault(slack_id, {})
     existing = week_pending.get(week)
-    if existing:
+    if existing and existing.get("ts"):
         existing_ids = {x.get("id") for x in existing["posts"]}
         existing["posts"] = existing["posts"] + [p for p in new_posts if p.get("id") not in existing_ids]
         client.chat_update(channel=existing["channel"], ts=existing["ts"], blocks=build_dm_blocks(slack_id, week), text="New retro posts!")
     else:
         dm_ch = client.conversations_open(users=slack_id)["channel"]["id"]
-        week_pending[week] = {"channel": dm_ch, "ts": None, "posts": new_posts}
+        if existing:
+            existing["posts"] = existing["posts"] + [p for p in new_posts if p.get("id") not in {x.get("id") for x in existing["posts"]}]
+        else:
+            week_pending[week] = {"channel": dm_ch, "ts": None, "posts": new_posts}
         result = client.chat_postMessage(channel=dm_ch, text="New retro posts!", blocks=build_dm_blocks(slack_id, week))
         week_pending[week]["ts"] = result["ts"]
 
@@ -311,7 +316,7 @@ user_profile_pics = {}  # slack_id -> profilePhotoURL string
 user_retro_usernames = {}  # slack_id -> retro display username
 home_errors = {}  # slack_id -> error string to show below post button
 
-@app.command("/link-retro-account")
+@app.command(f"{CMD}link-retro-account")
 def link_retro_account(ack, body, respond):
     ack()
     username = body.get("text", "").strip()
@@ -330,7 +335,7 @@ def link_retro_account(ack, body, respond):
     save_retro_id(slack_id, user_id)
     respond(f"Linked your Slack account to retro user *@{username}*. Make sure to accept the friend request from @hcslackforwarder!")
 
-@app.command("/check-retro-link")
+@app.command(f"{CMD}check-retro-link")
 def check_retro_link(ack, body, respond):
     ack()
     slack_id = body["user_id"]
@@ -1096,7 +1101,9 @@ def refresh_cache_loop():
                 refresh_and_notify(slack_id, app.client)
                 print(f"  refreshed cache for {slack_id}")
             except Exception as e:
+                import traceback
                 print(f"  failed to refresh cache for {slack_id}: {e}")
+                traceback.print_exc()
 
 if __name__ == "__main__":
     threading.Thread(target=refresh_cache_loop, daemon=True).start()
