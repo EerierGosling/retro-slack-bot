@@ -1056,23 +1056,42 @@ def unlink_retro_account(ack, body, client):
 def refresh_and_notify(slack_id, client):
     retro_user_id = get_user_id(slack_id)
     if not retro_user_id:
+        print(f"[refresh] {slack_id}: no retro user id, skipping")
+        return
+    if slack_id not in home_cache or not home_cache[slack_id]:
+        print(f"[refresh] {slack_id}: no cache, seeding current week")
+        now = datetime.now()
+        iso = now.isocalendar()
+        current_week = f"{iso[0]}_{iso[1]:02d}"
+        posts = retro.get_week_media(retro_user_id, current_week)
+        home_cache.setdefault(slack_id, {})[current_week] = sorted(posts, key=lambda p: p.get("createdAt") or 0)
+        print(f"[refresh] {slack_id}: seeded {len(posts)} posts for {current_week}")
         return
     cached_weeks = list(home_cache.get(slack_id, {}).keys())
-    if not cached_weeks:
-        return
+    print(f"[refresh] {slack_id}: checking weeks {cached_weeks}")
     for week in cached_weeks:
         old_ids = {p.get("id") for p in home_cache[slack_id].get(week, [])}
         posts = retro.get_week_media(retro_user_id, week)
         fetched = sorted(posts, key=lambda p: p.get("createdAt") or 0)
         home_cache[slack_id][week] = fetched
         new_posts = [p for p in fetched if p.get("id") not in old_ids]
+        print(f"[refresh] {slack_id} week {week}: {len(old_ids)} old, {len(fetched)} fetched, {len(new_posts)} new")
         if new_posts and old_ids:
+            print(f"[refresh] {slack_id} week {week}: sending DM for {len(new_posts)} new posts")
             send_or_update_dm(slack_id, week, new_posts, client)
+        elif new_posts and not old_ids:
+            print(f"[refresh] {slack_id} week {week}: skipping DM — old_ids empty (first seed)")
+
+def get_all_linked_slack_ids():
+    c = get_cursor()
+    c.execute("SELECT slack_id FROM users WHERE retro_username IS NOT NULL")
+    return [row[0] for row in c.fetchall()]
 
 def refresh_cache_loop():
     while True:
         time.sleep(30)
-        for slack_id in list(home_cache.keys()):
+        all_ids = set(home_cache.keys()) | set(get_all_linked_slack_ids())
+        for slack_id in list(all_ids):
             try:
                 refresh_and_notify(slack_id, app.client)
                 print(f"  refreshed cache for {slack_id}")
