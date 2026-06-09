@@ -2,6 +2,7 @@ import os
 import re
 import time
 import pickle
+import requests
 import psycopg2
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -72,6 +73,44 @@ def save_show_location(slack_id, value):
         """,
         (slack_id, value)
     )
+
+def build_card(post, week, index, show_location, block_id_prefix="carousel-card", selected=False, show_actions=True):
+    is_video = bool(post.get("videoURL") or post.get("originalVideoURL"))
+    prefix = "[Video] " if is_video else ""
+    dt = datetime.fromtimestamp(post.get("createdAt"), tz=timezone(timedelta(seconds=post.get("timeZoneOffset") or 0)))
+
+    if show_location and post.get("locationName"):
+        title = {
+            "title": {"type": "mrkdwn", "text": prefix + post.get("locationName"), "verbatim": False},
+            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%a, %b %-d"), "verbatim": False},
+        }
+    else:
+        title = {
+            "title": {"type": "mrkdwn", "text": prefix + dt.strftime("%A"), "verbatim": False},
+            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%b %-d"), "verbatim": False},
+        }
+
+    card = {
+        "type": "card",
+        "block_id": f"{block_id_prefix}-{week}-{index}",
+        **title,
+        "hero_image": {
+            "type": "image",
+            "image_url": card_image_url(post.get("fullSizeURL")),
+            "alt_text": "retro photo"
+        },
+    }
+    if show_actions:
+        card["actions"] = [
+            {
+                "type": "button",
+                "action_id": "select_post",
+                "value": post.get("id"),
+                "text": {"type": "plain_text", "text": "✓ selected" if selected else "select"},
+                **( {"style": "primary"} if selected else {} )
+            }
+        ]
+    return card
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 retro = Retro(refresh_token=os.getenv("RETRO_REFRESH_TOKEN"))
@@ -195,45 +234,8 @@ def update_home_tab(event, client):
             week_posts = []
 
             for i, post in enumerate(posts):
-                comments = ""
-
-                dt = datetime.fromtimestamp(post.get("createdAt"), tz=timezone(timedelta(seconds=post.get("timeZoneOffset") or 0)))
-
-                if show_location and post.get("locationName"):
-                    title = {
-                        "title": {"type": "mrkdwn", "text": post.get("locationName"), "verbatim": False},
-                        "subtitle": {"type": "mrkdwn", "text": dt.strftime("%a, %b %-d"), "verbatim": False},
-                    }
-                else:
-                    title = {
-                        "title": {"type": "mrkdwn", "text": dt.strftime("%A"), "verbatim": False},
-                        "subtitle": {"type": "mrkdwn", "text": dt.strftime("%b %-d"), "verbatim": False},
-                    }
-
-                post_id = post.get("id")
-                is_selected = post_id in selected_posts.get(user_id, set())
-                card = {
-                    "type": "card",
-                    "block_id": f"carousel-card-{week}-{i}",
-                    **title,
-                    "hero_image": {
-                        "type": "image",
-                        "image_url": card_image_url(post.get("fullSizeURL")),
-                        "alt_text": "photo"
-                    },
-                    "actions": [
-                        {
-                            "type": "button",
-                            "action_id": "select_post",
-                            "value": post_id,
-                            "text": {"type": "plain_text", "text": "✓ selected" if is_selected else "select"},
-                            **( {"style": "primary"} if is_selected else {} )
-                        }
-                    ]
-                }
-                if comments:
-                    card["body"] = {"type": "mrkdwn", "text": comments, "verbatim": False}
-                week_posts.append(card)
+                is_selected = post.get("id") in selected_posts.get(user_id, set())
+                week_posts.append(build_card(post, week, i, show_location, selected=is_selected))
 
             if week_posts:
                 blocks.append({"type": "header", "text": {"type": "plain_text", "text": f"Week {week.split('_')[1]}"}})
@@ -314,17 +316,37 @@ def handle_post_week(ack, body, client):
     if not to_post:
         client.chat_postEphemeral(channel=slack_id, user=slack_id, text="no posts selected for this week!")
         return
+
+    show_location = get_show_location(slack_id)
+    cards = [
+        build_card(post, week, i, show_location, block_id_prefix="post-card", show_actions=False)
+        for i, post in enumerate(to_post)
+    ]
+
+    resp = client.chat_postMessage(
+        channel=channel_id,
+        text="retro photos",
+        blocks=[{"type": "carousel", "elements": cards[:10]}]
+    )
+    thread_ts = resp["ts"]
     for post in to_post:
-        client.chat_postMessage(
-            channel=channel_id,
-            blocks=[
-                {
-                    "type": "image",
-                    "image_url": post.get("fullSizeURL"),
-                    "alt_text": "retro photo"
-                }
-            ]
-        )
+        if post.get("originalVideoURL"):
+            client.conversations_join(channel=channel_id)
+            video_data = requests.get(post["originalVideoURL"]).content
+            client.files_upload_v2(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                content=video_data,
+                filename="retro-video.mov",
+                title="video"
+            )
+        else:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="retro photo",
+                blocks=[{"type": "image", "image_url": post.get("fullSizeURL"), "alt_text": "retro photo"}]
+            )
         selected_posts[slack_id].discard(post.get("id"))
 
 @app.action("unlink_retro_account")
