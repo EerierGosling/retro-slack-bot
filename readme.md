@@ -6,4 +6,8 @@ this bot is deployed on hack club slack as [@Retro Forwarder](https://hackclub.e
 
 _this bot uses my [retro sdk](https://github.com/EerierGosling/retro-sdk), available on PyPi as [retro-sdk](https://pypi.org/project/retro-sdk/)_
 
+you can forward any set of posts from the app home page:
 ![App Home](readme-images/app-home.png)
+
+and when you post new pictures, the app sends you a dm asking if you want to forward them anywhere:
+![App DM](readme-images/dm.png)
