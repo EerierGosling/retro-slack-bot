@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import pickle
 import psycopg2
@@ -76,6 +77,7 @@ app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 retro = Retro(refresh_token=os.getenv("RETRO_REFRESH_TOKEN"))
 
 selected_posts = {}  # slack_id -> set of post ids
+selected_channels = {}  # slack_id -> {week -> channel_id}
 home_cache = {}  # slack_id -> {week: [post, ...]}
 
 @app.command("/link-retro-account")
@@ -287,6 +289,43 @@ def handle_select_post(ack, body, client):
     else:
         selected_posts[slack_id].add(post_id)
     update_home_tab({"user": slack_id}, client)
+
+@app.action(re.compile(r"pick_channel_(.+)"))
+def handle_pick_channel(ack, body):
+    ack()
+    slack_id = body["user"]["id"]
+    action = body["actions"][0]
+    week = action["action_id"].removeprefix("pick_channel_")
+    channel_id = action["selected_conversation"]
+    selected_channels.setdefault(slack_id, {})[week] = channel_id
+
+@app.action(re.compile(r"post_week_(.+)"))
+def handle_post_week(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    week = body["actions"][0]["value"]
+    channel_id = selected_channels.get(slack_id, {}).get(week)
+    if not channel_id:
+        client.chat_postEphemeral(channel=slack_id, user=slack_id, text="pick a channel first!")
+        return
+    posts = home_cache.get(slack_id, {}).get(week, [])
+    user_selected = selected_posts.get(slack_id, set())
+    to_post = [p for p in posts if p.get("id") in user_selected]
+    if not to_post:
+        client.chat_postEphemeral(channel=slack_id, user=slack_id, text="no posts selected for this week!")
+        return
+    for post in to_post:
+        client.chat_postMessage(
+            channel=channel_id,
+            blocks=[
+                {
+                    "type": "image",
+                    "image_url": post.get("fullSizeURL"),
+                    "alt_text": "retro photo"
+                }
+            ]
+        )
+        selected_posts[slack_id].discard(post.get("id"))
 
 @app.action("unlink_retro_account")
 def unlink_retro_account(ack, body, client):
