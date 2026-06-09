@@ -18,7 +18,7 @@ from urllib.parse import quote
 def card_image_url(url):
     return f"https://wsrv.nl/?url={quote(url, safe='')}&w=1572&h=884&fit=contain&bg=transparent"
 
-def avatar_image_url(url):
+def profile_picture_url(url):
     return f"https://wsrv.nl/?url={quote(url, safe='')}&w=36&h=36&fit=cover"
 
 def get_cursor():
@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS post_channels (
     PRIMARY KEY (post_id, channel_id)
 )
 """)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS post_captions (
+    post_id TEXT PRIMARY KEY,
+    caption TEXT
+)
+""")
 
 def record_post_channel(post_id, channel_id):
     c = get_cursor()
@@ -56,6 +62,20 @@ def record_post_channel(post_id, channel_id):
         "INSERT INTO post_channels (post_id, channel_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
         (post_id, channel_id)
     )
+
+def save_caption(post_id, caption):
+    c = get_cursor()
+    c.execute(
+        "INSERT INTO post_captions (post_id, caption) VALUES (%s, %s) ON CONFLICT (post_id) DO UPDATE SET caption = EXCLUDED.caption",
+        (post_id, caption)
+    )
+
+def load_captions_from_db(post_ids):
+    if not post_ids:
+        return {}
+    c = get_cursor()
+    c.execute("SELECT post_id, caption FROM post_captions WHERE post_id = ANY(%s)", (list(post_ids),))
+    return {row[0]: row[1] for row in c.fetchall()}
 
 def get_post_channels(post_ids):
     if not post_ids:
@@ -99,7 +119,7 @@ def save_show_location(slack_id, value):
         (slack_id, value)
     )
 
-def build_card(post, week, index, show_location, block_id_prefix="carousel-card", selected=False, show_actions=True, posted_channels=None, removed_locs=None):
+def build_card(post, week, index, show_location, block_id_prefix="carousel-card", selected=False, show_actions=True, posted_channels=None, removed_locs=None, caption=None, caption_hidden=False, profile_pic_url=None):
     is_video = bool(post.get("videoURL") or post.get("originalVideoURL"))
     prefix = "[Video] " if is_video else ""
     post_id = post.get("id")
@@ -120,8 +140,10 @@ def build_card(post, week, index, show_location, block_id_prefix="carousel-card"
 
     card = {
         "type": "card",
-        "block_id": f"{block_id_prefix}-{week}-{index}",
+        "block_id": f"{block_id_prefix}-{post_id}",
         **title,
+        **({"icon": {"type": "image", "image_url": profile_picture_url(profile_pic_url), "alt_text": "profile picture"}} if profile_pic_url else {}),
+        **({"body": {"type": "mrkdwn", "text": caption, "verbatim": False}} if caption and not caption_hidden else {}),
         "hero_image": {
             "type": "image",
             "image_url": card_image_url(post.get("fullSizeURL")),
@@ -130,23 +152,29 @@ def build_card(post, week, index, show_location, block_id_prefix="carousel-card"
     }
     if show_actions:
         card["actions"] = [
+            *( [{
+                "type": "button",
+                "action_id": "home_remove_location",
+                "value": post_id,
+                "text": {"type": "plain_text", "text": "Include location" if loc_removed else "Remove location"}
+            }] if post.get("locationName") else [] ),
+            *( [{
+                "type": "button",
+                "action_id": "home_toggle_caption",
+                "value": post_id,
+                "text": {"type": "plain_text", "text": "Include caption" if caption_hidden else "Remove caption"}
+            }] if caption else [] ),
             {
                 "type": "button",
                 "action_id": "select_post",
                 "value": post_id,
                 "text": {"type": "plain_text", "text": "Selected" if selected else "Select"},
                 **( {"style": "primary"} if selected else {} )
-            },
-            *( [{
-                "type": "button",
-                "action_id": "home_remove_location",
-                "value": post_id,
-                "text": {"type": "plain_text", "text": "Include location" if loc_removed else "Remove location"}
-            }] if post.get("locationName") else [] )
+            }
         ]
     return card
 
-def build_dm_card(post, week, index, excluded, removed_locs):
+def build_dm_card(post, week, excluded, removed_locs, caption=None, caption_hidden=False, profile_pic_url=None):
     is_video = bool(post.get("videoURL") or post.get("originalVideoURL"))
     prefix = "[Video] " if is_video else ""
     post_id = post.get("id")
@@ -166,8 +194,10 @@ def build_dm_card(post, week, index, excluded, removed_locs):
     is_excluded = post_id in excluded
     return {
         "type": "card",
-        "block_id": f"dm-card-{week}-{index}",
+        "block_id": f"dm-card-{post_id}",
         **title,
+        **({"icon": {"type": "image", "image_url": profile_picture_url(profile_pic_url), "alt_text": "profile picture"}} if profile_pic_url else {}),
+        **({"body": {"type": "mrkdwn", "text": caption, "verbatim": False}} if caption and not caption_hidden else {}),
         "hero_image": {"type": "image", "image_url": card_image_url(post.get("fullSizeURL")), "alt_text": "retro photo"},
         "actions": [
             {
@@ -182,7 +212,13 @@ def build_dm_card(post, week, index, excluded, removed_locs):
                 "action_id": "dm_remove_location",
                 "value": value,
                 "text": {"type": "plain_text", "text": "Include location" if post_id in removed_locs else "Remove location"}
-            }] if post.get("locationName") else [] )
+            }] if post.get("locationName") else [] ),
+            *( [{
+                "type": "button",
+                "action_id": "dm_toggle_caption",
+                "value": value,
+                "text": {"type": "plain_text", "text": "Include caption" if caption_hidden else "Remove caption"}
+            }] if caption else [] )
         ]
     }
 
@@ -191,9 +227,31 @@ def build_dm_blocks(slack_id, week):
     posts = dm_pending.get(slack_id, {}).get(week, {}).get("posts", [])
     excluded = dm_excluded_posts.get(key, set())
     removed_locs = dm_removed_locations.get(key, set())
-    cards = [build_dm_card(p, week, i, excluded, removed_locs) for i, p in enumerate(posts)]
+    captions = dm_captions.get(key, {})
+    hidden = dm_hidden_captions.get(key, set())
+    cards = [build_dm_card(p, week, excluded, removed_locs, caption=captions.get(p.get("id")), caption_hidden=p.get("id") in hidden, profile_pic_url=user_profile_pics.get(slack_id)) for p in posts]
     week_num = int(week.split("_")[1])
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{len(posts)} new post{'s' if len(posts) != 1 else ''} in Week {week_num}!* Click *Exclude* on any picture to exclude it from posting."}}]
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{len(posts)} new post{'s' if len(posts) != 1 else ''} in Week {week_num}!* Click *Exclude* on any picture to exclude it from posting."}},
+        {"type": "actions", "elements": [{"type": "button", "action_id": "dm_load_captions", "value": week, "text": {"type": "plain_text", "text": "Load post captions"}}]},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": "Loading captions may take a minute if you have a lot of posts! Please be patient."}]},
+        {"type": "actions", "elements": [
+            {
+                "type": "button",
+                "action_id": "dm_toggle_all_locations",
+                "value": week,
+                **({"style": "danger"} if not removed_locs else {"style": "primary"}),
+                "text": {"type": "plain_text", "text": "Remove all locations" if not removed_locs else "Show all locations"}
+            },
+            {
+                "type": "button",
+                "action_id": "dm_toggle_all_captions",
+                "value": week,
+                **({"style": "primary"} if hidden else {"style": "danger"}),
+                "text": {"type": "plain_text", "text": "Show all captions" if hidden else "Remove all captions"}
+            }
+        ]},
+    ]
     for i in range(0, len(cards), 10):
         blocks.append({"type": "carousel", "elements": cards[i:i + 10]})
         blocks.append({"type": "divider"})
@@ -204,7 +262,7 @@ def build_dm_blocks(slack_id, week):
             {
                 "type": "conversations_select",
                 "action_id": "dm_pick_channel",
-                "placeholder": {"type": "plain_text", "text": "Pick a channel"},
+                "placeholder": {"type": "context", "text": "Pick a channel"},
                 **({"initial_conversation": selected_ch} if selected_ch else {})
             },
             {
@@ -245,6 +303,13 @@ dm_pending = {}  # slack_id -> {week -> {channel, ts, posts}}
 dm_selected_channels = {}  # (slack_id, week) -> channel_id for DM post
 home_removed_locations = {}  # slack_id -> set of post_ids with location stripped on home tab
 home_selected_week = {}  # slack_id -> week string (currently shown week)
+home_captions = {}  # slack_id -> {post_id -> caption str}
+home_hidden_captions = {}  # slack_id -> set of post_ids with caption hidden
+dm_captions = {}  # (slack_id, week) -> {post_id -> caption str}
+dm_hidden_captions = {}  # (slack_id, week) -> set of post_ids with caption hidden
+user_profile_pics = {}  # slack_id -> profilePhotoURL string
+user_retro_usernames = {}  # slack_id -> retro display username
+home_errors = {}  # slack_id -> error string to show below post button
 
 @app.command("/link-retro-account")
 def link_retro_account(ack, body, respond):
@@ -318,34 +383,32 @@ def update_home_tab(event, client):
             iso = (now - timedelta(weeks=i)).isocalendar()
             weeks.append(f"{iso[0]}_{iso[1]:02d}")
 
-        if user_id not in home_cache:
-            print("fetching from API...")
-            fetched = {}
-            for week in weeks:
-                print(f"  fetching week {week}")
-                posts = retro.get_week_media(retro_user_id, week)
-                fetched[week] = sorted(posts, key=lambda p: p.get("createdAt") or 0)
-            home_cache[user_id] = fetched
-        else:
-            print("using cache")
-
-        retro_user = retro.get_user(retro_user_id) or {}
-
         active_week = home_selected_week.get(user_id, weeks[0])
         if active_week not in weeks:
             active_week = weeks[0]
-            home_selected_week[user_id] = active_week
+        home_selected_week[user_id] = active_week
 
-        toggle_option = {"text": {"type": "plain_text", "text": "Show locations"}, "value": "show_location"}
+        cache = home_cache.setdefault(user_id, {})
+        if active_week not in cache:
+            print(f"fetching week {active_week} from API...")
+            posts = retro.get_week_media(retro_user_id, active_week)
+            cache[active_week] = sorted(posts, key=lambda p: p.get("createdAt") or 0)
+        else:
+            print(f"using cache for week {active_week}")
+
+        retro_user = retro.get_user(retro_user_id) or {}
+        if retro_user.get("profilePhotoURL"):
+            user_profile_pics[user_id] = retro_user["profilePhotoURL"]
+        if retro_user.get("username"):
+            user_retro_usernames[user_id] = retro_user["username"]
+        hidden_caps = home_hidden_captions.get(user_id, set())
+
         week_options = [{"text": {"type": "plain_text", "text": f"Week {int(w.split('_')[1])}"}, "value": w} for w in weeks]
         blocks = [
             {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f":hyper-dino-wave: Welcome @{retro_user.get('username')}!", "emoji": True}
-            },
-            {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": ":warning: Because this page is very slow to update, use the select buttons and then click `Load selections` to view what you've selected."}
+                "text": {"type": "mrkdwn", "text": f":wave-pikachu-2:  *Welcome @{retro_user.get('username')}!*"},
+                **( {"accessory": {"type": "image", "image_url": f"https://wsrv.nl/?url={quote(retro_user['profilePhotoURL'], safe='')}&w=128&h=128&fit=cover", "alt_text": "profile picture"}} if retro_user.get("profilePhotoURL") else {} )
             },
             { "type": "divider" },
             {
@@ -353,39 +416,30 @@ def update_home_tab(event, client):
                 "elements": [
                     {
                         "type": "button",
-                        "action_id": "load_selections",
-                        "style": "primary",
-                        "text": {"type": "plain_text", "text": "Load selections"}
-                    },
-                    {
-                        "type": "button",
                         "action_id": "refresh_home",
                         "text": {"type": "plain_text", "text": "Refresh posts"}
                     },
                     {
-                        "type": "checkboxes",
-                        "action_id": "toggle_show_location",
-                        "options": [toggle_option],
-                        "initial_options": [toggle_option] if show_location else []
-                    },
-                    {
-                        "type": "static_select",
-                        "action_id": "pick_week",
-                        "options": week_options,
-                        "initial_option": {"text": {"type": "plain_text", "text": f"Week {int(active_week.split('_')[1])}"}, "value": active_week}
+                        "type": "button",
+                        "action_id": "load_captions",
+                        "text": {"type": "plain_text", "text": "Load post captions"}
                     }
                 ]
             },
             {
-                "type": "actions",
+                "type": "context",
                 "elements": [
-                    {
-                        "type": "button",
-                        "action_id": "load_selections",
-                        "style": "primary",
-                        "text": {"type": "plain_text", "text": "Load selections"}
-                    }
+                    {"type": "mrkdwn", "text": "Loading captions may take a minute if you have a lot of posts! Please be patient."}
                 ]
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": " "}
+            },
+            { "type": "divider" },
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "Select posts"}
             },
             {
                 "type": "actions",
@@ -421,8 +475,41 @@ def update_home_tab(event, client):
                         "action_id": f"select_by_time_{active_week}",
                         "value": active_week,
                         "text": {"type": "plain_text", "text": "Select by posted time"}
+                    },
+                    {
+                        "type": "button",
+                        "action_id": f"select_all_unposted_{active_week}",
+                        "value": active_week,
+                        "text": {"type": "plain_text", "text": "All unposted to Slack"}
                     }
                 ]
+            },
+            { "type": "divider" },
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "Other options" }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "toggle_show_location",
+                        **({"style": "danger"} if show_location else {"style": "primary"}),
+                        "text": {"type": "plain_text", "text": "Remove all locations" if show_location else "Show all locations"}
+                    },
+                    {
+                        "type": "button",
+                        "action_id": "toggle_all_captions",
+                        **({"style": "primary"} if hidden_caps else {"style": "danger"}),
+                        "text": {"type": "plain_text", "text": "Show all captions" if hidden_caps else "Remove all captions"}
+                    }
+                ]
+            },
+            { "type": "divider" },
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "Send to channel"}
             },
             {
                 "type": "actions",
@@ -436,7 +523,21 @@ def update_home_tab(event, client):
                         "type": "button",
                         "action_id": f"post_week_{active_week}",
                         "value": active_week,
+                        "style": "primary",
                         "text": {"type": "plain_text", "text": "Post selected"}
+                    }
+                ]
+            },
+            *([{"type": "context", "elements": [{"type": "mrkdwn", "text": f":x: {home_errors.pop(user_id)}"}]}] if user_id in home_errors else []),
+            { "type": "divider" },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "static_select",
+                        "action_id": "pick_week",
+                        "options": week_options,
+                        "initial_option": {"text": {"type": "plain_text", "text": f"Week {int(active_week.split('_')[1])}"}, "value": active_week}
                     }
                 ]
             }
@@ -445,6 +546,10 @@ def update_home_tab(event, client):
         active_posts = home_cache[user_id].get(active_week, [])
         channels_by_post = get_post_channels([p.get("id") for p in active_posts])
         removed_locs = home_removed_locations.get(user_id, set())
+        captions = home_captions.setdefault(user_id, {})
+        missing_ids = [p.get("id") for p in active_posts if p.get("id") not in captions]
+        if missing_ids:
+            captions.update(load_captions_from_db(missing_ids))
 
         week = active_week
         posts = active_posts
@@ -453,7 +558,7 @@ def update_home_tab(event, client):
 
         for i, post in enumerate(posts):
             is_selected = post.get("id") in selected_posts.get(user_id, set())
-            week_posts.append(build_card(post, week, i, show_location, selected=is_selected, posted_channels=channels_by_post.get(post.get("id")), removed_locs=removed_locs))
+            week_posts.append(build_card(post, week, i, show_location, selected=is_selected, posted_channels=channels_by_post.get(post.get("id")), removed_locs=removed_locs, caption=captions.get(post.get("id")), caption_hidden=post.get("id") in hidden_caps, profile_pic_url=user_profile_pics.get(user_id)))
 
         if week_posts:
             chunks = [week_posts[i:i + 10] for i in range(0, len(week_posts), 10)]
@@ -472,8 +577,22 @@ def on_home_opened(event, client):
 def handle_toggle_show_location(ack, body, client):
     ack()
     slack_id = body["user"]["id"]
-    selected = body["actions"][0]["selected_options"]
-    save_show_location(slack_id, len(selected) > 0)
+    save_show_location(slack_id, not get_show_location(slack_id))
+    update_home_tab({"user": slack_id}, client)
+
+@app.action("toggle_all_captions")
+def handle_toggle_all_captions(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    active_week = home_selected_week.get(slack_id)
+    posts = home_cache.get(slack_id, {}).get(active_week, [])
+    caps = home_captions.get(slack_id, {})
+    hidden = home_hidden_captions.setdefault(slack_id, set())
+    post_ids_with_captions = {p.get("id") for p in posts if caps.get(p.get("id"))}
+    if hidden & post_ids_with_captions:
+        hidden -= post_ids_with_captions
+    else:
+        hidden |= post_ids_with_captions
     update_home_tab({"user": slack_id}, client)
 
 @app.action("refresh_home")
@@ -487,6 +606,45 @@ def handle_refresh_home(ack, body, client):
         home_cache.pop(slack_id, None)
     update_home_tab({"user": slack_id}, client)
 
+@app.action("load_captions")
+def handle_load_captions(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    retro_user_id = get_user_id(slack_id)
+    if not retro_user_id:
+        return
+    now = datetime.now()
+    current_week = f"{now.isocalendar()[0]}_{now.isocalendar()[1]:02d}"
+    active_week = home_selected_week.get(slack_id, current_week)
+    all_posts = home_cache.get(slack_id, {}).get(active_week, [])
+    if not all_posts:
+        print(f"no cached posts for week {active_week}, fetching...")
+        all_posts = retro.get_week_media(retro_user_id, active_week)
+        home_cache.setdefault(slack_id, {})[active_week] = sorted(all_posts, key=lambda p: p.get("createdAt") or 0)
+        all_posts = home_cache[slack_id][active_week]
+    print(f"loading captions for {len(all_posts)} posts in week {active_week}...")
+    captions = home_captions.setdefault(slack_id, {})
+    for post in all_posts:
+        post_id = post.get("id")
+        try:
+            comments = sorted(retro.get_media_comments(retro_user_id, post_id), key=lambda c: c.get("createdAt") or 0)
+            print(f"  post {post_id}: {len(comments)} comments")
+            lines = []
+            for comment in comments:
+                if comment.get("uid") == retro_user_id:
+                    lines.append(comment.get("text", ""))
+                else:
+                    print(f"    stopping at comment from uid {comment.get('uid')}")
+                    break
+            caption = "\n\n".join(lines) if lines else None
+            captions[post_id] = caption
+            save_caption(post_id, caption)
+            print(f"    caption: {repr(caption)}")
+        except Exception as e:
+            print(f"  failed to load captions for {post_id}: {e}")
+    print("captions loaded, refreshing...")
+    update_home_tab({"user": slack_id}, client)
+
 @app.action("pick_week")
 def handle_pick_week(ack, body, client):
     ack()
@@ -495,7 +653,7 @@ def handle_pick_week(ack, body, client):
     update_home_tab({"user": slack_id}, client)
 
 @app.action("home_remove_location")
-def handle_home_remove_location(ack, body):
+def handle_home_remove_location(ack, body, client):
     ack()
     slack_id = body["user"]["id"]
     post_id = body["actions"][0]["value"]
@@ -504,9 +662,104 @@ def handle_home_remove_location(ack, body):
         locs.discard(post_id)
     else:
         locs.add(post_id)
+    update_home_tab({"user": slack_id}, client)
+
+@app.action("home_toggle_caption")
+def handle_home_toggle_caption(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    post_id = body["actions"][0]["value"]
+    hidden = home_hidden_captions.setdefault(slack_id, set())
+    if post_id in hidden:
+        hidden.discard(post_id)
+    else:
+        hidden.add(post_id)
+    update_home_tab({"user": slack_id}, client)
+
+@app.action("dm_load_captions")
+def handle_dm_load_captions(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    week = body["actions"][0]["value"]
+    retro_user_id = get_user_id(slack_id)
+    if not retro_user_id:
+        return
+    key = (slack_id, week)
+    posts = dm_pending.get(slack_id, {}).get(week, {}).get("posts", [])
+    print(f"loading DM captions for {len(posts)} posts in week {week}...")
+    captions = dm_captions.setdefault(key, {})
+    for post in posts:
+        post_id = post.get("id")
+        try:
+            comments = sorted(retro.get_media_comments(retro_user_id, post_id), key=lambda c: c.get("createdAt") or 0)
+            lines = []
+            for comment in comments:
+                if comment.get("uid") == retro_user_id:
+                    lines.append(comment.get("text", ""))
+                else:
+                    break
+            caption = "\n\n".join(lines) if lines else None
+            captions[post_id] = caption
+            save_caption(post_id, caption)
+        except Exception as e:
+            print(f"  failed to load caption for {post_id}: {e}")
+    print("DM captions loaded, updating message...")
+    info = dm_pending.get(slack_id, {}).get(week)
+    if info:
+        client.chat_update(channel=info["channel"], ts=info["ts"], blocks=build_dm_blocks(slack_id, week), text="New retro posts!")
+
+@app.action("dm_toggle_all_locations")
+def handle_dm_toggle_all_locations(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    week = body["actions"][0]["value"]
+    key = (slack_id, week)
+    posts = dm_pending.get(slack_id, {}).get(week, {}).get("posts", [])
+    removed = dm_removed_locations.setdefault(key, set())
+    post_ids_with_loc = {p.get("id") for p in posts if p.get("locationName")}
+    if removed & post_ids_with_loc:
+        removed -= post_ids_with_loc
+    else:
+        removed |= post_ids_with_loc
+    info = dm_pending.get(slack_id, {}).get(week)
+    if info:
+        client.chat_update(channel=info["channel"], ts=info["ts"], blocks=build_dm_blocks(slack_id, week), text="New retro posts!")
+
+@app.action("dm_toggle_all_captions")
+def handle_dm_toggle_all_captions(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    week = body["actions"][0]["value"]
+    key = (slack_id, week)
+    posts = dm_pending.get(slack_id, {}).get(week, {}).get("posts", [])
+    caps = dm_captions.get(key, {})
+    hidden = dm_hidden_captions.setdefault(key, set())
+    post_ids_with_captions = {p.get("id") for p in posts if caps.get(p.get("id"))}
+    if hidden & post_ids_with_captions:
+        hidden -= post_ids_with_captions
+    else:
+        hidden |= post_ids_with_captions
+    info = dm_pending.get(slack_id, {}).get(week)
+    if info:
+        client.chat_update(channel=info["channel"], ts=info["ts"], blocks=build_dm_blocks(slack_id, week), text="New retro posts!")
+
+@app.action("dm_toggle_caption")
+def handle_dm_toggle_caption(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    week, post_id = body["actions"][0]["value"].split("|", 1)
+    key = (slack_id, week)
+    hidden = dm_hidden_captions.setdefault(key, set())
+    if post_id in hidden:
+        hidden.discard(post_id)
+    else:
+        hidden.add(post_id)
+    info = dm_pending.get(slack_id, {}).get(week)
+    if info:
+        client.chat_update(channel=info["channel"], ts=info["ts"], blocks=build_dm_blocks(slack_id, week), text="New retro posts!")
 
 @app.action("select_post")
-def handle_select_post(ack, body):
+def handle_select_post(ack, body, client):
     ack()
     slack_id = body["user"]["id"]
     post_id = body["actions"][0]["value"]
@@ -516,11 +769,6 @@ def handle_select_post(ack, body):
         selected_posts[slack_id].discard(post_id)
     else:
         selected_posts[slack_id].add(post_id)
-
-@app.action("load_selections")
-def handle_load_selections(ack, body, client):
-    ack()
-    slack_id = body["user"]["id"]
     update_home_tab({"user": slack_id}, client)
 
 @app.action("dm_remove_location")
@@ -580,8 +828,20 @@ def handle_dm_post(ack, body, client):
     if not posts_to_send:
         return
     channels_by_post = get_post_channels([p.get("id") for p in posts_to_send])
-    cards = [build_card(p, week, i, show_location and p.get("id") not in removed_locs, block_id_prefix="dm-post-card", show_actions=False, posted_channels=channels_by_post.get(p.get("id"))) for i, p in enumerate(posts_to_send)]
-    carousel_msg = client.chat_postMessage(channel=channel_id, text="New retro posts", blocks=[{"type": "carousel", "elements": cards[:10]}])
+    dm_caps = dm_captions.get(key, {})
+    dm_hidden = dm_hidden_captions.get(key, set())
+    cards = [build_card(p, week, i, show_location and p.get("id") not in removed_locs, block_id_prefix="dm-post-card", show_actions=False, posted_channels=channels_by_post.get(p.get("id")), caption=dm_caps.get(p.get("id")), caption_hidden=p.get("id") in dm_hidden, profile_pic_url=user_profile_pics.get(slack_id)) for i, p in enumerate(posts_to_send)]
+    retro_username = user_retro_usernames.get(slack_id) or get_user_id(slack_id)
+    header_block = {"type": "section", "text": {"type": "mrkdwn", "text": f"<@{slack_id}> - <https://retro.app/@{retro_username}|@{retro_username}>"}}
+    carousel_blocks = [header_block] + [{"type": "carousel", "elements": cards[i:i+10]} for i in range(0, len(cards), 10)]
+    try:
+        carousel_msg = client.chat_postMessage(channel=channel_id, text="New retro posts", blocks=carousel_blocks, unfurl_links=False, unfurl_media=False)
+    except Exception as e:
+        err = str(e)
+        if "not_in_channel" in err or "channel_not_found" in err:
+            dm_ch = client.conversations_open(users=slack_id)["channel"]["id"]
+            client.chat_postMessage(channel=dm_ch, text=f":x: Couldn't post to <#{channel_id}> — the bot isn't in that channel. Add the bot to the channel and try again.")
+        return
     thread_ts = carousel_msg["ts"]
     for post in posts_to_send:
         post_id = post.get("id")
@@ -644,6 +904,18 @@ def handle_select_recent_unposted(ack, body, client):
     channels = get_post_channels([p.get("id") for p in recent])
     selected_posts.setdefault(slack_id, set()).update(
         p.get("id") for p in recent if not channels.get(p.get("id"))
+    )
+    update_home_tab({"user": slack_id}, client)
+
+@app.action(re.compile(r"select_all_unposted_(.+)"))
+def handle_select_all_unposted(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    week = body["actions"][0]["value"]
+    posts = home_cache.get(slack_id, {}).get(week, [])
+    channels = get_post_channels([p.get("id") for p in posts])
+    selected_posts.setdefault(slack_id, set()).update(
+        p.get("id") for p in posts if not channels.get(p.get("id"))
     )
     update_home_tab({"user": slack_id}, client)
 
@@ -721,27 +993,36 @@ def handle_post_week(ack, body, client):
     week = body["actions"][0]["value"]
     channel_id = selected_channels.get(slack_id, {}).get(week)
     if not channel_id:
-        client.chat_postEphemeral(channel=slack_id, user=slack_id, text="Pick a channel first!")
+        home_errors[slack_id] = "Select a channel first!"
+        update_home_tab({"user": slack_id}, client)
         return
     posts = home_cache.get(slack_id, {}).get(week, [])
     user_selected = selected_posts.get(slack_id, set())
     to_post = [p for p in posts if p.get("id") in user_selected]
     if not to_post:
-        client.chat_postEphemeral(channel=slack_id, user=slack_id, text="No posts selected for this week!")
+        home_errors[slack_id] = "No posts selected!"
+        update_home_tab({"user": slack_id}, client)
         return
 
     show_location = get_show_location(slack_id)
     removed_locs = home_removed_locations.get(slack_id, set())
+    hidden_caps = home_hidden_captions.get(slack_id, set())
     cards = [
-        build_card(post, week, i, show_location, block_id_prefix="post-card", show_actions=False, removed_locs=removed_locs)
+        build_card(post, week, i, show_location, block_id_prefix="post-card", show_actions=False, removed_locs=removed_locs, caption=home_captions.get(slack_id, {}).get(post.get("id")), caption_hidden=post.get("id") in hidden_caps, profile_pic_url=user_profile_pics.get(slack_id))
         for i, post in enumerate(to_post)
     ]
 
-    resp = client.chat_postMessage(
-        channel=channel_id,
-        text="retro photos",
-        blocks=[{"type": "carousel", "elements": cards[:10]}]
-    )
+    retro_username = user_retro_usernames.get(slack_id) or get_user_id(slack_id)
+    header_block = {"type": "section", "text": {"type": "mrkdwn", "text": f"<@{slack_id}> - <https://retro.app/@{retro_username}|@{retro_username}>"}}
+    carousel_blocks = [header_block] + [{"type": "carousel", "elements": cards[i:i+10]} for i in range(0, len(cards), 10)]
+    try:
+        resp = client.chat_postMessage(channel=channel_id, text="retro photos", blocks=carousel_blocks, unfurl_links=False, unfurl_media=False)
+    except Exception as e:
+        err = str(e)
+        if "not_in_channel" in err or "channel_not_found" in err:
+            home_errors[slack_id] = f"I can't post to <#{channel_id}> — I'm not in that channel! Add me and try again."
+            update_home_tab({"user": slack_id}, client)
+        return
     thread_ts = resp["ts"]
     for post in to_post:
         if post.get("originalVideoURL"):
@@ -776,19 +1057,17 @@ def refresh_and_notify(slack_id, client):
     retro_user_id = get_user_id(slack_id)
     if not retro_user_id:
         return
-    now = datetime.now()
-    weeks = [f"{(now - timedelta(weeks=i)).isocalendar()[0]}_{(now - timedelta(weeks=i)).isocalendar()[1]:02d}" for i in range(4)]
-    old_ids = {p.get("id") for week_posts in home_cache.get(slack_id, {}).values() for p in week_posts}
-    fetched = {}
-    for week in weeks:
+    cached_weeks = list(home_cache.get(slack_id, {}).keys())
+    if not cached_weeks:
+        return
+    for week in cached_weeks:
+        old_ids = {p.get("id") for p in home_cache[slack_id].get(week, [])}
         posts = retro.get_week_media(retro_user_id, week)
-        fetched[week] = sorted(posts, key=lambda p: p.get("createdAt") or 0)
-    home_cache[slack_id] = fetched
-    if old_ids:
-        for week, week_posts in fetched.items():
-            new_posts = [p for p in week_posts if p.get("id") not in old_ids]
-            if new_posts:
-                send_or_update_dm(slack_id, week, new_posts, client)
+        fetched = sorted(posts, key=lambda p: p.get("createdAt") or 0)
+        home_cache[slack_id][week] = fetched
+        new_posts = [p for p in fetched if p.get("id") not in old_ids]
+        if new_posts and old_ids:
+            send_or_update_dm(slack_id, week, new_posts, client)
 
 def refresh_cache_loop():
     while True:
