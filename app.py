@@ -299,6 +299,21 @@ def send_or_update_dm(slack_id, week, new_posts, client):
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 retro = Retro(refresh_token=os.getenv("RETRO_REFRESH_TOKEN"))
 
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
+
+def add_to_channel(slack_id, client):
+    if not SLACK_CHANNEL:
+        return
+    try:
+        client.conversations_join(channel=SLACK_CHANNEL)
+    except Exception:
+        pass
+    try:
+        client.conversations_invite(channel=SLACK_CHANNEL, users=slack_id)
+    except Exception as e:
+        if "already_in_channel" not in str(e):
+            print(f"failed to invite {slack_id} to {SLACK_CHANNEL}: {e}")
+
 selected_posts = {}  # slack_id -> set of post ids
 selected_channels = {}  # slack_id -> {week -> channel_id}
 home_cache = {}  # slack_id -> {week: [post, ...]}
@@ -317,7 +332,7 @@ user_retro_usernames = {}  # slack_id -> retro display username
 home_errors = {}  # slack_id -> error string to show below post button
 
 @app.command(f"{CMD}link-retro-account")
-def link_retro_account(ack, body, respond):
+def link_retro_account(ack, body, respond, client):
     ack()
     username = body.get("text", "").strip()
     if not username:
@@ -333,6 +348,7 @@ def link_retro_account(ack, body, respond):
         respond(f"Couldn't send a friend request to *@{username}* — your friend requests are likely locked! Unlock friend requests in their retro settings and try again.")
         return
     save_retro_id(slack_id, user_id)
+    add_to_channel(slack_id, client)
     respond(f"Linked your Slack account to retro user *@{username}*. Make sure to accept the friend request from @hcslackforwarder!")
 
 @app.command(f"{CMD}check-retro-link")
