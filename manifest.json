@@ -1,0 +1,73 @@
+{
+    "display_information": {
+        "name": "Retro Forwarder",
+        "description": "Run /link-retro-account and use the app home to manage your posts :)",
+        "background_color": "#6603ca",
+        "long_description": "Forward the pictures you post on Retro to Slack! Run /link-retro-account and use the app home to manage your posts :)\r\n\r\nOpen source at https://github.com/EerierGosling/retro-slack-bot"
+    },
+    "features": {
+        "app_home": {
+            "home_tab_enabled": true,
+            "messages_tab_enabled": false,
+            "messages_tab_read_only_enabled": false
+        },
+        "bot_user": {
+            "display_name": "Retro Forwarder",
+            "always_online": false
+        },
+        "slash_commands": [
+            {
+                "command": "/link-retro-account",
+                "description": "Link your Retro account!",
+                "usage_hint": "[username]",
+                "should_escape": false
+            },
+            {
+                "command": "/check-retro-link",
+                "description": "Check if your Retro account is linked",
+                "should_escape": false
+            }
+        ],
+        "unfurl_domains": [
+            "firebasestorage.googleapis.com",
+            "stream.mux.com"
+        ]
+    },
+    "oauth_config": {
+        "scopes": {
+            "bot": [
+                "files:read",
+                "channels:join",
+                "channels:read",
+                "chat:write",
+                "chat:write.public",
+                "commands",
+                "im:history",
+                "im:read",
+                "im:write",
+                "im:write.topic",
+                "links.embed:write",
+                "links:read",
+                "links:write",
+                "files:write"
+            ]
+        },
+        "pkce_enabled": false
+    },
+    "settings": {
+        "event_subscriptions": {
+            "bot_events": [
+                "app_home_opened",
+                "link_shared",
+                "message.im"
+            ]
+        },
+        "interactivity": {
+            "is_enabled": true
+        },
+        "org_deploy_enabled": false,
+        "socket_mode_enabled": true,
+        "token_rotation_enabled": false,
+        "is_mcp_enabled": false
+    }
+}
