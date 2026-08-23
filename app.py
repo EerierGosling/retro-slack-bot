@@ -9,6 +9,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
 from retro_sdk import Retro, FieldFilter
+from google.api_core.exceptions import PermissionDenied
 from datetime import datetime, timedelta, timezone
 
 load_dotenv()
@@ -347,6 +348,7 @@ dm_pending = {}  # slack_id -> {week -> {channel, ts, posts}}
 dm_selected_channels = {}  # (slack_id, week) -> channel_id for DM post
 home_removed_locations = {}  # slack_id -> set of post_ids with location stripped on home tab
 home_selected_week = {}  # slack_id -> week string (currently shown week)
+home_selected_year = {}  # slack_id -> int year (currently shown year, key-holders only)
 home_captions = {}  # slack_id -> {post_id -> caption str}
 home_hidden_captions = {}  # slack_id -> set of post_ids with caption hidden
 dm_captions = {}  # (slack_id, week) -> {post_id -> caption str}
@@ -394,6 +396,13 @@ def check_retro_link(ack, body, respond):
     respond(f"Your Slack account is linked to retro user *@{username}*!")
 
 
+EARLIEST_SELECTABLE_YEAR = 2023
+
+def iso_weeks_in_year(year):
+    # Dec 28 always falls in the last ISO week of the year, so this reads off
+    # whether that year has 52 or 53 weeks.
+    return datetime(year, 12, 28).isocalendar()[1]
+
 def update_home_tab(event, client):
     print("loading...")
     user_id = event["user"]
@@ -423,17 +432,43 @@ def update_home_tab(event, client):
         show_location = get_show_location(user_id)
 
         now = datetime.now()
-        weeks = []
-        for i in range(4):
-            iso = (now - timedelta(weeks=i)).isocalendar()
-            weeks.append(f"{iso[0]}_{iso[1]:02d}")
+        cache = home_cache.setdefault(user_id, {})
+
+        probe_dt = now - timedelta(weeks=5)
+        probe_iso = probe_dt.isocalendar()
+        probe_week = f"{probe_iso[0]}_{probe_iso[1]:02d}"
+        try:
+            probe_posts = retro.get_week_media(retro_user_id, probe_week)
+            cache[probe_week] = sorted(probe_posts, key=lambda p: p.get("createdAt") or 0)
+            has_key = True
+        except PermissionDenied:
+            has_key = False
+
+        current_year, current_week_num = now.isocalendar()[0], now.isocalendar()[1]
+
+        if has_key:
+            # year selector goes back to EARLIEST_SELECTABLE_YEAR; for the current year,
+            # weeks run 1 through the current week, and for any earlier year, all of
+            # that year's weeks are shown.
+            selected_year = home_selected_year.get(user_id, current_year)
+            if selected_year < EARLIEST_SELECTABLE_YEAR or selected_year > current_year:
+                selected_year = current_year
+            home_selected_year[user_id] = selected_year
+
+            max_week = current_week_num if selected_year == current_year else iso_weeks_in_year(selected_year)
+            weeks = [f"{selected_year}_{w:02d}" for w in range(max_week, 0, -1)]
+        else:
+            selected_year = None
+            weeks = []
+            for i in range(4):
+                iso = (now - timedelta(weeks=i)).isocalendar()
+                weeks.append(f"{iso[0]}_{iso[1]:02d}")
 
         active_week = home_selected_week.get(user_id, weeks[0])
         if active_week not in weeks:
             active_week = weeks[0]
         home_selected_week[user_id] = active_week
 
-        cache = home_cache.setdefault(user_id, {})
         if active_week not in cache:
             print(f"fetching week {active_week} from API...")
             posts = retro.get_week_media(retro_user_id, active_week)
@@ -449,6 +484,7 @@ def update_home_tab(event, client):
         hidden_caps = home_hidden_captions.get(user_id, set())
 
         week_options = [{"text": {"type": "plain_text", "text": f"Week {int(w.split('_')[1])}"}, "value": w} for w in weeks]
+        year_options = [{"text": {"type": "plain_text", "text": str(y)}, "value": str(y)} for y in range(current_year, EARLIEST_SELECTABLE_YEAR - 1, -1)] if has_key else []
         blocks = [
             {
                 "type": "section",
@@ -583,7 +619,13 @@ def update_home_tab(event, client):
                         "action_id": "pick_week",
                         "options": week_options,
                         "initial_option": {"text": {"type": "plain_text", "text": f"Week {int(active_week.split('_')[1])}"}, "value": active_week}
-                    }
+                    },
+                    *([{
+                        "type": "static_select",
+                        "action_id": "pick_year",
+                        "options": year_options,
+                        "initial_option": {"text": {"type": "plain_text", "text": str(selected_year)}, "value": str(selected_year)}
+                    }] if has_key else [])
                 ]
             }
         ]
@@ -695,6 +737,13 @@ def handle_pick_week(ack, body, client):
     ack()
     slack_id = body["user"]["id"]
     home_selected_week[slack_id] = body["actions"][0]["selected_option"]["value"]
+    update_home_tab({"user": slack_id}, client)
+
+@app.action("pick_year")
+def handle_pick_year(ack, body, client):
+    ack()
+    slack_id = body["user"]["id"]
+    home_selected_year[slack_id] = int(body["actions"][0]["selected_option"]["value"])
     update_home_tab({"user": slack_id}, client)
 
 @app.action("home_remove_location")
