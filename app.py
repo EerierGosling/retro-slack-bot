@@ -26,9 +26,10 @@ def profile_picture_url(url):
 
 def get_cursor():
     global conn
-    try:
-        conn.isolation_level
-    except Exception:
+    # conn.closed is nonzero once psycopg2 has detected the connection is dead
+    # (e.g. the server dropped an idle connection) — unlike conn.isolation_level,
+    # which never touches the socket and so never notices.
+    if conn.closed:
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         conn.autocommit = True
     return conn.cursor()
