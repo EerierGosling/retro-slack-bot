@@ -105,6 +105,28 @@ def get_user_id(slack_id):
     row = c.fetchone()
     return row[0] if row else None
 
+def get_slack_id_by_retro_id(retro_user_id):
+    c = get_cursor()
+    c.execute("SELECT slack_id FROM users WHERE retro_username = %s", (retro_user_id,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+def build_tagged_users_suffix(post):
+    tagged = post.get("taggedUsers")
+    if not tagged:
+        return ""
+    mentions = []
+    for uid in tagged:
+        slack_id = get_slack_id_by_retro_id(uid)
+        if slack_id:
+            mentions.append(f"<@{slack_id}>")
+        else:
+            tagged_user = retro.get_user(uid) or {}
+            username = tagged_user.get("username")
+            if username:
+                mentions.append(f"@{username}")
+    return " · " + ", ".join(mentions) if mentions else ""
+
 def get_show_location(slack_id):
     c = get_cursor()
     c.execute("SELECT show_location FROM users WHERE slack_id = %s", (slack_id,))
@@ -126,18 +148,19 @@ def build_card(post, week, index, show_location, block_id_prefix="carousel-card"
     prefix = "[Video] " if is_video else ""
     post_id = post.get("id")
     dt = datetime.fromtimestamp(post.get("createdAt"), tz=timezone(timedelta(seconds=post.get("timeZoneOffset") or 0)))
+    tagged_suffix = build_tagged_users_suffix(post)
     channel_suffix = " · " + " ".join(f"<#{c}>" for c in posted_channels) if posted_channels else ""
     loc_removed = removed_locs and post_id in removed_locs
 
     if show_location and post.get("locationName") and not loc_removed:
         title = {
             "title": {"type": "mrkdwn", "text": prefix + post.get("locationName"), "verbatim": False},
-            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%a, %b %-d") + channel_suffix, "verbatim": False},
+            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%a, %b %-d") + tagged_suffix + channel_suffix, "verbatim": False},
         }
     else:
         title = {
             "title": {"type": "mrkdwn", "text": prefix + dt.strftime("%A"), "verbatim": False},
-            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%b %-d") + channel_suffix, "verbatim": False},
+            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%b %-d") + tagged_suffix + channel_suffix, "verbatim": False},
         }
 
     card = {
@@ -182,16 +205,17 @@ def build_dm_card(post, week, excluded, removed_locs, caption=None, caption_hidd
     post_id = post.get("id")
     value = f"{week}|{post_id}"
     dt = datetime.fromtimestamp(post.get("createdAt"), tz=timezone(timedelta(seconds=post.get("timeZoneOffset") or 0)))
+    tagged_suffix = build_tagged_users_suffix(post)
     show_loc = post.get("locationName") and post_id not in removed_locs
     if show_loc:
         title = {
             "title": {"type": "mrkdwn", "text": prefix + post.get("locationName"), "verbatim": False},
-            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%a, %b %-d"), "verbatim": False},
+            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%a, %b %-d") + tagged_suffix, "verbatim": False},
         }
     else:
         title = {
             "title": {"type": "mrkdwn", "text": prefix + dt.strftime("%A"), "verbatim": False},
-            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%b %-d"), "verbatim": False},
+            "subtitle": {"type": "mrkdwn", "text": dt.strftime("%b %-d") + tagged_suffix, "verbatim": False},
         }
     is_excluded = post_id in excluded
     return {
