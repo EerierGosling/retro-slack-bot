@@ -49,7 +49,9 @@
                 "links.embed:write",
                 "links:read",
                 "links:write",
-                "files:write"
+                "files:write",
+                "channels:manage",
+                "channels:write.invites"
             ]
         },
         "pkce_enabled": false
