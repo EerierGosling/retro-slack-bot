@@ -24,18 +24,37 @@ def card_image_url(url):
 def profile_picture_url(url):
     return f"https://wsrv.nl/?url={quote(url, safe='')}&w=36&h=36&fit=cover"
 
-def get_cursor():
-    global conn
-    # conn.closed is nonzero once psycopg2 has detected the connection is dead
-    # (e.g. the server dropped an idle connection) — unlike conn.isolation_level,
-    # which never touches the socket and so never notices.
-    if conn.closed:
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-        conn.autocommit = True
-    return conn.cursor()
+def connect_db():
+    # keepalives stop the server/NAT from silently dropping idle connections
+    c = psycopg2.connect(
+        os.getenv("DATABASE_URL"),
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5,
+    )
+    c.autocommit = True
+    return c
 
-conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-conn.autocommit = True
+def db_execute(query, params=()):
+    # conn.closed only flips after a query has already failed on a dead socket,
+    # so checking it up front isn't enough — reconnect and retry once on failure.
+    # Safe to retry since autocommit is on and every write is idempotent.
+    global conn
+    for attempt in range(2):
+        try:
+            if conn.closed:
+                conn = connect_db()
+            c = conn.cursor()
+            c.execute(query, params)
+            return c
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            if attempt:
+                raise
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = connect_db()
+
+conn = connect_db()
 cur = conn.cursor()
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
@@ -61,15 +80,13 @@ CREATE TABLE IF NOT EXISTS post_captions (
 """)
 
 def record_post_channel(post_id, channel_id):
-    c = get_cursor()
-    c.execute(
+    c = db_execute(
         "INSERT INTO post_channels (post_id, channel_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
         (post_id, channel_id)
     )
 
 def save_caption(post_id, caption):
-    c = get_cursor()
-    c.execute(
+    c = db_execute(
         "INSERT INTO post_captions (post_id, caption) VALUES (%s, %s) ON CONFLICT (post_id) DO UPDATE SET caption = EXCLUDED.caption",
         (post_id, caption)
     )
@@ -77,23 +94,20 @@ def save_caption(post_id, caption):
 def load_captions_from_db(post_ids):
     if not post_ids:
         return {}
-    c = get_cursor()
-    c.execute("SELECT post_id, caption FROM post_captions WHERE post_id = ANY(%s)", (list(post_ids),))
+    c = db_execute("SELECT post_id, caption FROM post_captions WHERE post_id = ANY(%s)", (list(post_ids),))
     return {row[0]: row[1] for row in c.fetchall()}
 
 def get_post_channels(post_ids):
     if not post_ids:
         return {}
-    c = get_cursor()
-    c.execute("SELECT post_id, channel_id FROM post_channels WHERE post_id = ANY(%s)", (list(post_ids),))
+    c = db_execute("SELECT post_id, channel_id FROM post_channels WHERE post_id = ANY(%s)", (list(post_ids),))
     result = {}
     for post_id, channel_id in c.fetchall():
         result.setdefault(post_id, []).append(channel_id)
     return result
 
 def save_retro_id(slack_id, user_id):
-    c = get_cursor()
-    c.execute(
+    c = db_execute(
         """
         INSERT INTO users (slack_id, retro_username) VALUES (%s, %s)
         ON CONFLICT (slack_id) DO UPDATE SET retro_username = EXCLUDED.retro_username
@@ -102,14 +116,12 @@ def save_retro_id(slack_id, user_id):
     )
 
 def get_user_id(slack_id):
-    c = get_cursor()
-    c.execute("SELECT retro_username FROM users WHERE slack_id = %s", (slack_id,))
+    c = db_execute("SELECT retro_username FROM users WHERE slack_id = %s", (slack_id,))
     row = c.fetchone()
     return row[0] if row else None
 
 def get_slack_id_by_retro_id(retro_user_id):
-    c = get_cursor()
-    c.execute("SELECT slack_id FROM users WHERE retro_username = %s", (retro_user_id,))
+    c = db_execute("SELECT slack_id FROM users WHERE retro_username = %s", (retro_user_id,))
     row = c.fetchone()
     return row[0] if row else None
 
@@ -130,14 +142,12 @@ def build_tagged_users_suffix(post):
     return " · " + ", ".join(mentions) if mentions else ""
 
 def get_show_location(slack_id):
-    c = get_cursor()
-    c.execute("SELECT show_location FROM users WHERE slack_id = %s", (slack_id,))
+    c = db_execute("SELECT show_location FROM users WHERE slack_id = %s", (slack_id,))
     row = c.fetchone()
     return row[0] if row is not None else True
 
 def save_show_location(slack_id, value):
-    c = get_cursor()
-    c.execute(
+    c = db_execute(
         """
         INSERT INTO users (slack_id, show_location) VALUES (%s, %s)
         ON CONFLICT (slack_id) DO UPDATE SET show_location = EXCLUDED.show_location
@@ -690,8 +700,9 @@ def handle_refresh_home(ack, body, client):
     try:
         refresh_and_notify(slack_id, client)
     except Exception as e:
+        import traceback
         print(f"refresh failed: {e}")
-        home_cache.pop(slack_id, None)
+        traceback.print_exc()
     update_home_tab({"user": slack_id}, client)
 
 @app.action("load_captions")
@@ -1145,7 +1156,7 @@ def handle_post_week(ack, body, client):
 def unlink_retro_account(ack, body, client):
     ack()
     slack_id = body["user"]["id"]
-    get_cursor().execute("UPDATE users SET retro_username = NULL WHERE slack_id = %s", (slack_id,))
+    db_execute("UPDATE users SET retro_username = NULL WHERE slack_id = %s", (slack_id,))
     update_home_tab({"user": slack_id}, client)
 
 def refresh_and_notify(slack_id, client):
@@ -1160,26 +1171,37 @@ def refresh_and_notify(slack_id, client):
     for week in all_weeks:
         already_cached = week in cache
         old_ids = {p.get("id") for p in cache.get(week, [])}
-        posts = retro.get_week_media(retro_user_id, week)
+        try:
+            posts = retro.get_week_media(retro_user_id, week)
+        except PermissionDenied:
+            print(f"[refresh] {slack_id} week {week}: permission denied, skipping")
+            continue
         fetched = sorted(posts, key=lambda p: p.get("createdAt") or 0)
-        cache[week] = fetched
         new_posts = [p for p in fetched if p.get("id") not in old_ids]
         print(f"[refresh] {slack_id} week {week}: {len(old_ids)} old, {len(fetched)} fetched, {len(new_posts)} new (cached={already_cached})")
         if new_posts and already_cached:
             print(f"[refresh] {slack_id} week {week}: sending DM for {len(new_posts)} new posts")
+            # cache is only updated after the DM succeeds, so a failed send is retried next loop
             send_or_update_dm(slack_id, week, new_posts, client)
+            print(f"[refresh] {slack_id} week {week}: DM sent")
         elif new_posts and not already_cached:
             print(f"[refresh] {slack_id} week {week}: first seed, skipping DM")
+        cache[week] = fetched
 
 def get_all_linked_slack_ids():
-    c = get_cursor()
-    c.execute("SELECT slack_id FROM users WHERE retro_username IS NOT NULL")
+    c = db_execute("SELECT slack_id FROM users WHERE retro_username IS NOT NULL")
     return [row[0] for row in c.fetchall()]
 
 def refresh_cache_loop():
     while True:
         time.sleep(30)
-        all_ids = set(home_cache.keys()) | set(get_all_linked_slack_ids())
+        try:
+            all_ids = set(home_cache.keys()) | set(get_all_linked_slack_ids())
+        except Exception:
+            import traceback
+            print("  failed to list linked users, retrying next loop")
+            traceback.print_exc()
+            continue
         for slack_id in list(all_ids):
             try:
                 refresh_and_notify(slack_id, app.client)
